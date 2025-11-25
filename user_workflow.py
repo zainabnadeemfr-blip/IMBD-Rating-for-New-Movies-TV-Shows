@@ -116,6 +116,97 @@ def run_workflow(df: pd.DataFrame, target_column: str = "type", dropna: bool = T
         plt.tight_layout()
         figs["permutation_importance"] = fig_perm
 
+     # --- BEGIN: robust handling for movies_shows_by_year and k-means features ---
+
+# 1) Normalize header names to handle BOMs, spaces, weird chars
+import re
+def _normalize(s: str) -> str:
+    if s is None:
+        return s
+    s = str(s).replace('\ufeff', '').replace('\u200b', '')
+    s = s.strip()
+    s = re.sub(r'\s+', '_', s)
+    s = re.sub(r'[^\w]', '_', s)
+    s = re.sub(r'_+', '_', s)
+    return s.lower()
+
+orig_cols = list(df.columns)
+norm_map = { _normalize(c): c for c in orig_cols }
+# rename df columns to normalized names (temporary)
+df.columns = [_normalize(c) for c in orig_cols]
+
+# 2) If an alternate name exists for movies_shows_by_year, map it to canonical
+candidates = ["movies_shows_by_year","movies_shows_per_year","movies_by_year","shows_by_year",
+              "movies_shows_byyear","num_movies_by_year","count_by_year","count_per_year"]
+for cand in candidates:
+    if cand in df.columns and cand != "movies_shows_by_year":
+        df = df.rename(columns={cand: "movies_shows_by_year"})
+        break
+
+# 3) If movies_shows_by_year still missing but release_year exists, compute counts-per-year
+if "movies_shows_by_year" not in df.columns and "release_year" in df.columns:
+    # ensure release_year is numeric
+    df["release_year"] = pd.to_numeric(df["release_year"], errors="coerce")
+    counts = df["release_year"].value_counts(dropna=True)
+    df["movies_shows_by_year"] = df["release_year"].map(counts).fillna(0).astype(int)
+    # optional: log so user sees action
+    print("Computed movies_shows_by_year from release_year (counts per year).")
+
+# 4) Restore nicer (original) column names if you want, or proceed with normalized names.
+# If the rest of your code expects original names, map back:
+# Build reverse mapping for original column strings
+reverse_map = {}
+for norm, orig in norm_map.items():
+    reverse_map[norm] = orig
+# If you prefer to keep normalized names, skip this step.
+# If you want to revert others back to original for compatibility:
+# df = df.rename(columns={norm: reverse_map.get(norm, norm) for norm in df.columns})
+
+# --- prepare numeric k-means features robustly ---
+requested_kmeans = ['title_len', 'release_year', 'runtime', 'imdb_score', 'movies_shows_by_year']
+# choose available ones (normalized)
+available_kmeans = [c for c in requested_kmeans if c in df.columns]
+
+# coerce to numeric and handle missing values
+clean_kmeans = []
+for c in available_kmeans:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+    # fill small number of missing values with median to avoid dropping too many rows
+    if df[c].isna().any():
+        med = df[c].median()
+        if pd.isna(med):
+            # if median is NaN (column all NaN), skip the column
+            continue
+        df[c] = df[c].fillna(med)
+    clean_kmeans.append(c)
+
+# If we have at least 2 numeric features, run k-means; otherwise skip gracefully
+if len(clean_kmeans) >= 2:
+    kf = df[clean_kmeans]
+    from sklearn.cluster import KMeans
+    try:
+        kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+        clusters = kmeans.fit_predict(kf)
+        df['kmeans_cluster'] = clusters
+        # plotting below will use whichever columns exist (choose first two for scatter)
+        x_col, y_col = clean_kmeans[0], clean_kmeans[1]
+        # create the scatter figure as before, but use x_col, y_col
+        fig_km, ax = plt.subplots(figsize=(10,7))
+        scatter = ax.scatter(df[x_col], df[y_col], c=df['kmeans_cluster'], cmap='viridis', alpha=0.7)
+        ax.set_xlabel(x_col)
+        ax.set_ylabel(y_col)
+        ax.set_title('k-Means Clusters (4 clusters)')
+        fig_km.colorbar = plt.colorbar(scatter, ax=ax)
+        # save or attach fig_km for Streamlit display
+        # e.g., figs["kmeans"] = fig_km
+    except Exception as e:
+        print("k-means skipped due to error:", e)
+        # set figs["kmeans"] = None or continue
+else:
+    print(f"Skipping k-means: need >=2 numeric features, found {len(clean_kmeans)}: {clean_kmeans}")
+
+# --- END robust k-means handling ---
+
         # k-Means scatter (if numeric columns present)
         kmeans_features = ['title_len', 'release_year', 'runtime', 'imdb_score', 'movies_shows_by_year']
         if all(col in df.columns for col in kmeans_features):
